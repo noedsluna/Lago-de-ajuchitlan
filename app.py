@@ -1,7 +1,7 @@
 from flask import Flask, request, redirect, session, abort, send_from_directory, render_template_string, jsonify
 from pathlib import Path
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import sqlite3, os, json, uuid, html, secrets, hmac, unicodedata, re
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -80,15 +80,20 @@ with db() as c:
   c.execute("UPDATE businesses SET menu=? WHERE (menu IS NULL OR menu='' OR menu='[]') AND lower(name) LIKE '%lupe%' AND lower(name) LIKE '%gordita%'",(starter_menu,))
 def esc(x): return html.escape(str(x or ''),quote=True)
 def format_local_datetime(value):
-    """SQLite CURRENT_TIMESTAMP stores UTC; show registration time in Querétaro/Mexico City local time."""
+    """Convierte la fecha UTC a la hora local de Querétaro."""
     if not value:
         return ''
     try:
         dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(ZoneInfo('America/Mexico_City')).strftime('%Y-%m-%d %H:%M:%S')
-    except (ValueError, TypeError):
+        try:
+            local_zone = ZoneInfo('America/Mexico_City')
+        except ZoneInfoNotFoundError:
+            # Alternativa para Windows sin base de zonas horarias.
+            local_zone = timezone(timedelta(hours=-6), name='America/Mexico_City')
+        return dt.astimezone(local_zone).strftime('%Y-%m-%d %H:%M:%S')
+    except (ValueError, TypeError, OverflowError):
         return str(value)
 def page(title,body):
  return render_template_string('''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{title}} | Lago de Ajuchitlán</title><style>:root{--navy:#062b3a;--aqua:#55dce4;--bg:#eef5f5;--ink:#173640;--muted:#617a81}*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:var(--bg);color:var(--ink)}header{background:var(--navy);color:white;padding:16px max(5%,calc((100% - 1100px)/2));display:flex;align-items:center;justify-content:space-between;gap:15px;flex-wrap:wrap}header a{color:white;text-decoration:none;font-weight:bold}header .site-brand{display:flex;align-items:center;gap:10px;white-space:nowrap}header .site-brand img{width:58px;height:44px;object-fit:contain;background:transparent;border:0;border-radius:0;padding:0;box-shadow:none}header nav{display:flex;gap:12px;flex-wrap:wrap;font-size:13px}main{max-width:1100px;margin:32px auto;padding:0 18px}h1{margin:0 0 8px;font-size:clamp(26px,4vw,38px)}p{line-height:1.6}.muted{color:var(--muted)}.card{background:white;border:1px solid #d8e5e7;border-radius:16px;padding:22px;box-shadow:0 12px 30px #062b3a0c;margin:18px 0}.button,button{display:inline-block;border:0;border-radius:9px;background:var(--aqua);color:#062b3a;padding:11px 16px;font-weight:bold;text-decoration:none;cursor:pointer}.secondary{background:#e3eff0;color:#183b45}.danger{background:#ffe3e3;color:#8c2222}.field{display:flex;flex-direction:column;gap:6px;margin:12px 0}.field label{font-size:13px;font-weight:bold}.field input,.field textarea,.field select{width:100%;padding:12px;border:1px solid #cadbdd;border-radius:8px;font:inherit;background:#fcfefe}.field textarea{min-height:105px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}.biz img{width:100%;height:190px;object-fit:cover;border-radius:10px}.pill{display:inline-block;background:#e2f9f8;color:#087986;border-radius:30px;padding:5px 10px;font-size:12px;font-weight:bold}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.photos{display:flex;gap:8px;flex-wrap:wrap}.photos img{width:85px;height:70px;object-fit:cover;border-radius:7px}.menu-editor{background:#f8fcfc;border:1px solid #c9e5e6}.menu-group-editor{background:#fff;border:1px solid #d8e5e7;border-radius:12px;padding:14px;margin:12px 0}.food-menu{margin:18px 0;padding:16px;background:#f5fbfb;border:1px solid #d4e8e9;border-radius:12px}.food-menu h3{margin-top:0}.menu-group{margin-top:12px}.menu-group ul{margin:6px 0;padding-left:24px}.menu-group li{padding:3px 0}.biz>img{width:100%;height:190px;object-fit:cover;border-radius:10px}.stats{display:flex;gap:10px;flex-wrap:wrap}.stats span{background:#eaf7f8;border-radius:10px;padding:12px 16px;font-weight:bold}@media(max-width:600px){header{padding:14px}main{margin:20px auto}.card{padding:16px}}</style></head><body><header><a class="site-brand" href="/"><img src="/img/logo-ajuchitlan.png" alt=""><span>Lago de Ajuchitlán</span></a><nav><a href="/">Inicio</a><a href="/historia">Historia</a><a href="/leyendas">Leyendas</a><a href="/actividades">Actividades</a><a href="/lugares">Lugares cercanos</a><a href="/servicios">Puestos y servicios</a>{% if logged %}<a href="/admin">Administración</a><a href="/admin/usuarios">Usuarios</a><a href="/salir">Cerrar sesión</a>{% endif %}</nav></header><main><h1>{{title}}</h1>{{body|safe}}</main></body></html>''',title=title,body=body,logged=session.get('admin_logged') is True)
