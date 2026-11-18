@@ -3,9 +3,13 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import sqlite3, os, json, uuid, html, secrets, hmac, unicodedata, re
+from urllib.request import Request, urlopen
+from urllib.parse import quote
+from urllib.error import HTTPError, URLError
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-ROOT=Path(__file__).resolve().parent; DB=ROOT/'lago.db'; UP=ROOT/'static'/'uploads'; UP.mkdir(parents=True,exist_ok=True)
+ROOT=Path(__file__).resolve().parent; DB=Path(os.environ.get('LAGO_DB_PATH',str(ROOT/'lago.db'))); UP=ROOT/'static'/'uploads'; UP.mkdir(parents=True,exist_ok=True)
+DB.parent.mkdir(parents=True,exist_ok=True)
 def load_local_env():
     env_file=ROOT/'.env'
     if not env_file.is_file(): return
@@ -15,6 +19,59 @@ def load_local_env():
         key,value=line.split('=',1); key=key.strip(); value=value.strip().strip('\"').strip("'")
         if key and key not in os.environ: os.environ[key]=value
 load_local_env()
+USUARIOS_URL=os.environ.get('LAGO_USUARIOS_URL','').rstrip('/')
+PUESTOS_URL=os.environ.get('LAGO_PUESTOS_URL','').rstrip('/')
+SERVICE_TOKEN=os.environ.get('LAGO_SERVICE_TOKEN','')
+MICROSERVICES=bool(USUARIOS_URL and PUESTOS_URL and SERVICE_TOKEN)
+
+class ServiceError(Exception):
+    def __init__(self,status,message):
+        super().__init__(message)
+        self.status=status
+
+def service_request(base,path,method='GET',payload=None):
+    """Comunicación interna HTTP: la página NUNCA accede directamente a las bases de otros servicios."""
+    body=None if payload is None else json.dumps(payload,ensure_ascii=False).encode('utf-8')
+    req=Request(base+path, data=body, method=method,
+       headers={'X-Service-Token':SERVICE_TOKEN,'Content-Type':'application/json'})
+    try:
+        with urlopen(req,timeout=8) as response:
+            return json.load(response)
+    except HTTPError as error:
+        try: message=json.load(error).get('error','Error interno')
+        except (ValueError,TypeError): message='Error interno'
+        raise ServiceError(error.code,message) from error
+    except (URLError,TimeoutError) as error:
+        raise ServiceError(503,'No se puede conectar con el microservicio. Revisa Docker Desktop.') from error
+
+def users_get(uid):
+    try: return service_request(USUARIOS_URL,f'/interno/usuarios/{uid}')
+    except ServiceError as error:
+        if error.status==404: return None
+        raise
+
+def businesses_list():
+    if MICROSERVICES: return service_request(PUESTOS_URL,'/interno/negocios')['items']
+    with db() as c: return c.execute('SELECT * FROM businesses ORDER BY id DESC').fetchall()
+
+def business_get(bid):
+    if MICROSERVICES:
+        try: return service_request(PUESTOS_URL,f'/interno/negocios/{bid}')
+        except ServiceError as error:
+            if error.status==404: return None
+            raise
+    with db() as c: return c.execute('SELECT * FROM businesses WHERE id=?',(bid,)).fetchone()
+
+def business_payload():
+    return {'name':request.form.get('name','').strip(),
+     'category':request.form.get('category','Otro'),
+     'description':request.form.get('description',''),
+     'hours':request.form.get('hours',''),
+     'location':request.form.get('location',''),
+     'contact':request.form.get('contact',''),
+     'photos':savephotos(),
+     'menu':json.dumps(parse_menu(request.form.get('menu_json','[]')),ensure_ascii=False)}
+
 app=Flask(__name__,static_folder='static')
 app.secret_key=os.environ.get('LAGO_SECRET_KEY') or secrets.token_hex(32)
 # Cookies de sesión con protecciones razonables. En alojamiento HTTPS, configura LAGO_COOKIE_SECURE=1.
@@ -104,15 +161,18 @@ def validate_user_session():
     uid=session.get('user_id')
     if uid:
         try:
-            with db() as c: row=c.execute('SELECT active,role,name,email FROM users WHERE id=?',(uid,)).fetchone()
+            if MICROSERVICES:
+                row=users_get(uid)
+            else:
+                with db() as c: row=c.execute('SELECT active,role,name,email FROM users WHERE id=?',(uid,)).fetchone()
             if not row or not row['active']:
                 session.clear()
             else:
                 session['role']=row['role']; session['user_name']=row['name']; session['user_email']=row['email']
                 if row['role']=='admin': session['admin_logged']=True
                 else: session.pop('admin_logged',None)
-        except sqlite3.Error:
-            pass
+        except (sqlite3.Error,ServiceError):
+            session.clear()
 
 EDITABLE_PAGES={
  'index.html':'Inicio','historia.html':'Historia','leyendas.html':'Leyendas',
@@ -661,9 +721,16 @@ def login_page():
         return redirect('/admin')
     if login_is_limited('login:'+request.remote_addr):
         return redirect('/login?error=1')
-    with db() as c:
-        user = c.execute('SELECT id,name,email,password_hash,role,active FROM users WHERE email=?', (email,)).fetchone()
-    if user and user['active'] and check_password_hash(user['password_hash'], password):
+    if MICROSERVICES:
+        try:
+            user=service_request(USUARIOS_URL,'/interno/login','POST',{'email':email,'password':password})
+        except ServiceError as error:
+            if error.status==401: user=None
+            else: raise
+    else:
+        with db() as c:
+            user = c.execute('SELECT id,name,email,password_hash,role,active FROM users WHERE email=?', (email,)).fetchone()
+    if user and user['active'] and (MICROSERVICES or check_password_hash(user['password_hash'], password)):
         _login_attempts.pop('login:'+request.remote_addr, None)
         session.clear(); session['user_id'] = user['id']; session['user_name'] = user['name']; session['user_email'] = user['email']; session['role'] = user['role']
         if user['role'] == 'admin':
@@ -682,12 +749,21 @@ def register_page():
     password = request.form.get('password','')
     if len(name) < 2 or len(name) > 100 or not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', email) or len(password) < 8:
         return redirect('/registro?error=datos')
-    try:
-        with db() as c:
-            cur = c.execute('INSERT INTO users(name,email,password_hash,role) VALUES(?,?,?,?)', (name,email,generate_password_hash(password),'user'))
-            new_user_id = cur.lastrowid
-    except sqlite3.IntegrityError:
-        return redirect('/registro?error=existe')
+    if MICROSERVICES:
+        try:
+            registered=service_request(USUARIOS_URL,'/interno/usuarios','POST',{'name':name,'email':email,'password':password})
+            new_user_id=registered['id']
+        except ServiceError as error:
+            if error.status==409: return redirect('/registro?error=existe')
+            if error.status==400: return redirect('/registro?error=datos')
+            raise
+    else:
+        try:
+            with db() as c:
+                cur = c.execute('INSERT INTO users(name,email,password_hash,role) VALUES(?,?,?,?)', (name,email,generate_password_hash(password),'user'))
+                new_user_id = cur.lastrowid
+        except sqlite3.IntegrityError:
+            return redirect('/registro?error=existe')
     # Al terminar el registro, iniciar sesión automáticamente como usuario normal.
     # La cuenta nueva nunca recibe permisos de administrador por registrarse.
     session.clear()
@@ -734,8 +810,7 @@ def patos_page(): return send_site_page('patos.html')
 @app.route('/api/negocios')
 def api_businesses():
     """Devuelve los puestos guardados para mostrarlos en el directorio público de Puestos y servicios."""
-    with db() as c:
-        rows = c.execute('SELECT id,name,category,description,hours,location,contact,photos,menu FROM businesses ORDER BY id DESC').fetchall()
+    rows=businesses_list()
     result = []
     for r in rows:
         try:
@@ -767,7 +842,7 @@ def api_businesses():
     return jsonify(result)
 @app.route('/servicios')
 def services():
- return send_from_directory(ROOT, 'servicios.html')
+ return send_site_page('servicios.html')
 
 @app.route('/servicios.html')
 def services_html_redirect():
@@ -885,24 +960,90 @@ def savephotos():
 @app.route('/admin')
 def admin():
  if not logged(): return redirect('/admin/entrar')
- with db() as c: rows=c.execute('SELECT * FROM businesses ORDER BY id DESC').fetchall()
- body=f"<div class='stats'><span>{len(rows)} puestos registrados</span><span>Base de datos SQLite</span><span>Fotos guardadas en el servidor</span></div><p><a class='button' href='/admin/negocio/nuevo'>+ Agregar puesto</a> <a class='button secondary' href='/admin/editor'>Editar páginas del sitio</a> <a class='button secondary' href='/admin/usuarios'>Administrar usuarios</a> <a class='button secondary' href='/'>Ver sitio público</a></p><div class='card'><h2>Negocios registrados</h2>"
+ rows=businesses_list()
+ body=f"<div class='stats'><span>{len(rows)} puestos registrados</span><span>SQLite: 2 bases en contenedores y 1 base local</span><span>Fotos guardadas en el servidor</span></div><p><a class='button' href='/admin/negocio/nuevo'>+ Agregar puesto</a> <a class='button secondary' href='/admin/editor'>Editar páginas del sitio</a> <a class='button secondary' href='/admin/usuarios'>Administrar usuarios</a> <a class='button secondary' href='/'>Ver sitio público</a></p><div class='card'><h2>Negocios registrados</h2>"
  if not rows: body+="<p class='muted'>Aún no hay puestos. Agrega el primero con el botón de arriba.</p>"
  for r in rows:
   pics=json.loads(r['photos'] or '[]'); thumb=f"<img src='{pics[0]}' style='width:74px;height:60px;object-fit:cover;border-radius:8px'>" if pics else ''
   body+=f"<div style='display:flex;align-items:center;gap:14px;justify-content:space-between;border-top:1px solid #e0ebec;padding:14px 0;flex-wrap:wrap'>{thumb}<div style='flex:1;min-width:140px'><b>{esc(r['name'])}</b><div class='muted'>{esc(r['category'])}</div></div><div class='actions'><a class='button secondary' href='/admin/negocio/{r['id']}'>Editar</a><form method='post' action='/admin/negocio/{r['id']}/eliminar' onsubmit=\"return confirm('¿Eliminar este puesto?')\"><button class='danger'>Eliminar</button></form></div></div>"
  body+='</div>'
  return page('Panel de administración',body)
+# Visor de SQLite de solo lectura: pensado para demostrar la base de datos en clase.
+# Lista blanca de tablas: ninguna consulta SQL se compone con nombres del visitante.
+TABLAS_CONSULTA={
+ 'businesses':'Puestos y negocios',
+ 'users':'Usuarios',
+ 'page_content':'Páginas editadas',
+ 'custom_pages':'Páginas personalizadas',
+}
+@app.route('/admin/base-de-datos')
+def admin_database_view():
+ if not logged(): return redirect('/admin/entrar')
+ table=request.args.get('tabla','businesses')
+ if table not in TABLAS_CONSULTA: abort(404)
+ if MICROSERVICES:
+  user_data=service_request(USUARIOS_URL,'/interno/usuarios')
+  biz_data=service_request(PUESTOS_URL,'/interno/negocios')
+  totals={'users':user_data['total'],'businesses':biz_data['total']}
+  with db() as c:
+   for name in ('page_content','custom_pages'):
+    totals[name]=c.execute('SELECT COUNT(*) FROM "'+name+'"').fetchone()[0]
+  if table in ('users','businesses'):
+   rows=(user_data['items'] if table=='users' else biz_data['items'])[:50]
+   columns=(['id','name','email','role','created_at','active'] if table=='users'
+       else ['id','name','category','description','hours','location','contact','photos','menu'])
+  else:
+   with db() as c:
+    columns=[row['name'] for row in c.execute('PRAGMA table_info("'+table+'")').fetchall()]
+    rows=c.execute('SELECT '+','.join('"'+name+'"' for name in columns)+' FROM "'+table+'" LIMIT 50').fetchall()
+ else:
+  with db() as c:
+   totals={name:c.execute('SELECT COUNT(*) FROM "'+name+'"').fetchone()[0] for name in TABLAS_CONSULTA}
+   columns=[row['name'] for row in c.execute('PRAGMA table_info("'+table+'")').fetchall()]
+   rows=c.execute('SELECT '+','.join('"'+name+'"' for name in columns if name!='password_hash')+' FROM "'+table+'" LIMIT 50').fetchall()
+ visible_columns=[name for name in columns if name!='password_hash']
+ body=("<p class='muted'>Estás viendo la base de datos SQLite del proyecto. "
+       + ("Los dos contenedores guardan usuarios.db y puestos.db; la página local utiliza lago.db para el contenido. " if MICROSERVICES else "Los datos se guardan en lago.db. ")
+       + "Esta pantalla es de <b>solo lectura</b>: no modifica ni borra registros. "
+       "No necesitas XAMPP ni phpMyAdmin para consultar esta base.</p>")
+ body+="<div class='stats'>"+''.join(f"<span>{esc(title)}: {count}</span>" for title,count in [(TABLAS_CONSULTA[t],totals[t]) for t in TABLAS_CONSULTA])+"</div>"
+ body+="<div class='card'><h2>Consultar tablas</h2><div class='actions'>"
+ body+=''.join(f"<a class='button {'secondary' if t!=table else ''}' href='/admin/base-de-datos?tabla={t}'>{esc(title)}</a>" for t,title in TABLAS_CONSULTA.items())
+ body+="</div><p class='muted'>Se muestran hasta 50 registros. Las contraseñas están protegidas y no se muestran.</p>"
+ if not rows:
+  body+="<p>Esta tabla está vacía. Puedes agregar contenido desde el panel de administración.</p>"
+ else:
+  labels={'id':'ID','name':'Nombre','email':'Correo','category':'Categoría','description':'Descripción','hours':'Horario','location':'Ubicación','contact':'Contacto','photos':'Fotografías','menu':'Menú','role':'Rol','active':'Activo','created_at':'Fecha de registro','path':'Archivo','html':'HTML guardado','updated_at':'Última edición','slug':'Identificador','title':'Título'}
+  body+="<div style='overflow-x:auto'><table style='width:100%;border-collapse:collapse;min-width:520px'><thead><tr>"
+  body+=''.join(f"<th style='padding:10px;text-align:left;border-bottom:2px solid #d4e8e9'>{esc(labels.get(col,col))}</th>" for col in visible_columns)
+  body+='</tr></thead><tbody>'
+  for row in rows:
+   body+="<tr style='border-bottom:1px solid #e0ebec'>"
+   for col in visible_columns:
+    value=row[col]
+    display=str(value) if value is not None else '—'
+    if col=='active': display='Sí' if value else 'No'
+    if len(display)>140: display=display[:137]+'…'
+    body+=f"<td style='padding:10px;vertical-align:top;max-width:270px;overflow-wrap:anywhere'>{esc(display)}</td>"
+   body+='</tr>'
+  body+='</tbody></table></div>'
+ body+="</div><p><a class='button secondary' href='/admin'>Volver al panel</a></p>"
+ return page('Base de datos del proyecto',body)
+
 @app.route('/admin/usuarios')
 def admin_users():
  if not logged(): return redirect('/admin/entrar')
  q=request.args.get('q','').strip()
- with db() as c:
-  if q:
-   users=c.execute("SELECT id,name,email,role,created_at,active FROM users WHERE name LIKE ? OR email LIKE ? ORDER BY created_at DESC,id DESC",(f'%{q}%',f'%{q}%')).fetchall()
-  else:
-   users=c.execute("SELECT id,name,email,role,created_at,active FROM users ORDER BY created_at DESC,id DESC").fetchall()
-  admin_count=c.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
+ if MICROSERVICES:
+  data=service_request(USUARIOS_URL,'/interno/usuarios'+('?q='+quote(q) if q else ''))
+  users=data['items']; admin_count=data['admins_activos']
+ else:
+  with db() as c:
+   if q:
+    users=c.execute("SELECT id,name,email,role,created_at,active FROM users WHERE name LIKE ? OR email LIKE ? ORDER BY created_at DESC,id DESC",(f'%{q}%',f'%{q}%')).fetchall()
+   else:
+    users=c.execute("SELECT id,name,email,role,created_at,active FROM users ORDER BY created_at DESC,id DESC").fetchall()
+   admin_count=c.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
  body="<p class='muted'>Administra las cuentas y sus permisos. Las contraseñas nunca se muestran.</p>"
  body+=f"<div class='stats'><span>{len(users)} usuarios mostrados</span><span>{admin_count} administradores activos</span></div>"
  body+=f"<form method='get' class='card' style='display:flex;gap:10px;flex-wrap:wrap;align-items:end'><div class='field' style='flex:1;min-width:220px;margin:0'><label for='q'>Buscar por nombre o correo</label><input id='q' name='q' value='{esc(q)}' placeholder='Escribe para buscar'></div><button type='submit'>Buscar</button><a class='button secondary' href='/admin/usuarios'>Limpiar</a></form>"
@@ -929,7 +1070,9 @@ def admin_users():
 @app.route('/admin/usuarios/<int:uid>/editar',methods=['GET','POST'])
 def edit_user(uid):
  if not logged(): return redirect('/admin/entrar')
- with db() as c: user=c.execute('SELECT id,name,email,role,active FROM users WHERE id=?',(uid,)).fetchone()
+ user=users_get(uid) if MICROSERVICES else None
+ if not MICROSERVICES:
+  with db() as c: user=c.execute('SELECT id,name,email,role,active FROM users WHERE id=?',(uid,)).fetchone()
  if not user: abort(404)
  error=''
  if request.method=='POST':
@@ -938,13 +1081,18 @@ def edit_user(uid):
   elif password and len(password)<8: error='La nueva contraseña debe tener al menos 8 caracteres.'
   else:
    try:
-    with db() as c:
-     c.execute('UPDATE users SET name=?,email=? WHERE id=?',(name,email,uid))
-     if password: c.execute('UPDATE users SET password_hash=? WHERE id=?',(generate_password_hash(password),uid))
+    if MICROSERVICES:
+     service_request(USUARIOS_URL,f'/interno/usuarios/{uid}','PUT',{'name':name,'email':email,'password':password})
+    else:
+     with db() as c:
+      c.execute('UPDATE users SET name=?,email=? WHERE id=?',(name,email,uid))
+      if password: c.execute('UPDATE users SET password_hash=? WHERE id=?',(generate_password_hash(password),uid))
     if uid==session.get('user_id'):
      session['user_name']=name; session['user_email']=email
     return redirect('/admin/usuarios')
-   except sqlite3.IntegrityError: error='Ese correo ya está registrado en otra cuenta.'
+   except (sqlite3.IntegrityError,ServiceError) as exc:
+    if isinstance(exc,ServiceError) and exc.status!=409: raise
+    error='Ese correo ya está registrado en otra cuenta.'
  body=f"<div class='card'><p class='muted'>Edita los datos de la cuenta. La contraseña solo se cambia si escribes una nueva.</p>{('<p>'+esc(error)+'</p>') if error else ''}<form method='post'><div class='field'><label for='name'>Nombre</label><input id='name' name='name' required maxlength='100' value='{esc(request.form.get('name',user['name']))}'></div><div class='field'><label for='email'>Correo electrónico</label><input id='email' name='email' type='email' required value='{esc(request.form.get('email',user['email']))}'></div><div class='field'><label for='password'>Nueva contraseña (opcional)</label><input id='password' name='password' type='password' minlength='8' autocomplete='new-password' placeholder='Deja vacío para no cambiarla'></div><div class='actions'><button type='submit'>Guardar cambios</button><a class='button secondary' href='/admin/usuarios'>Cancelar</a></div></form></div>"
  return page('Editar usuario',body)
 
@@ -953,39 +1101,60 @@ def change_user_role(uid):
  if not logged(): return redirect('/admin/entrar')
  role=request.form.get('role','')
  if role not in ('user','admin') or uid==session.get('user_id'): return redirect('/admin/usuarios')
- with db() as c:
-  current=c.execute('SELECT role,active FROM users WHERE id=?',(uid,)).fetchone()
-  if not current: abort(404)
-  if current['role']=='admin' and role=='user':
-   count=c.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
-   if count<=1: return page('No se puede cambiar el rol',"<div class='card'><p>No puedes quitar el último administrador activo.</p><a class='button secondary' href='/admin/usuarios'>Volver</a></div>")
-  c.execute('UPDATE users SET role=? WHERE id=?',(role,uid))
+ if MICROSERVICES:
+  try: service_request(USUARIOS_URL,f'/interno/usuarios/{uid}/rol','POST',{'role':role})
+  except ServiceError as error:
+   if error.status==409: return page('No se puede cambiar el rol',"<div class='card'><p>"+esc(str(error))+"</p><a class='button secondary' href='/admin/usuarios'>Volver</a></div>")
+   if error.status==404: abort(404)
+   raise
+ else:
+  with db() as c:
+   current=c.execute('SELECT role,active FROM users WHERE id=?',(uid,)).fetchone()
+   if not current: abort(404)
+   if current['role']=='admin' and role=='user':
+    count=c.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
+    if count<=1: return page('No se puede cambiar el rol',"<div class='card'><p>No puedes quitar el último administrador activo.</p><a class='button secondary' href='/admin/usuarios'>Volver</a></div>")
+   c.execute('UPDATE users SET role=? WHERE id=?',(role,uid))
  return redirect('/admin/usuarios')
 
 @app.route('/admin/usuarios/<int:uid>/estado',methods=['POST'])
 def toggle_user_status(uid):
  if not logged(): return redirect('/admin/entrar')
  if uid==session.get('user_id'): return redirect('/admin/usuarios')
- with db() as c:
-  user=c.execute('SELECT role,active FROM users WHERE id=?',(uid,)).fetchone()
-  if not user: abort(404)
-  if user['active'] and user['role']=='admin':
-   count=c.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
-   if count<=1: return page('No se puede bloquear',"<div class='card'><p>No puedes bloquear al último administrador activo.</p><a class='button secondary' href='/admin/usuarios'>Volver</a></div>")
-  c.execute('UPDATE users SET active=? WHERE id=?',(0 if user['active'] else 1,uid))
+ if MICROSERVICES:
+  try: service_request(USUARIOS_URL,f'/interno/usuarios/{uid}/estado','POST',{})
+  except ServiceError as error:
+   if error.status==409: return page('No se puede bloquear',"<div class='card'><p>"+esc(str(error))+"</p><a class='button secondary' href='/admin/usuarios'>Volver</a></div>")
+   if error.status==404: abort(404)
+   raise
+ else:
+  with db() as c:
+   user=c.execute('SELECT role,active FROM users WHERE id=?',(uid,)).fetchone()
+   if not user: abort(404)
+   if user['active'] and user['role']=='admin':
+    count=c.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
+    if count<=1: return page('No se puede bloquear',"<div class='card'><p>No puedes bloquear al último administrador activo.</p><a class='button secondary' href='/admin/usuarios'>Volver</a></div>")
+   c.execute('UPDATE users SET active=? WHERE id=?',(0 if user['active'] else 1,uid))
  return redirect('/admin/usuarios')
 
 @app.route('/admin/usuarios/<int:uid>/eliminar',methods=['POST'])
 def delete_user(uid):
  if not logged(): return redirect('/admin/entrar')
  if uid==session.get('user_id'): return page('No se puede eliminar',"<div class='card'><p>No puedes eliminar la cuenta con la que tienes iniciada la sesión.</p><a class='button secondary' href='/admin/usuarios'>Volver</a></div>")
- with db() as c:
-  user=c.execute('SELECT role,active FROM users WHERE id=?',(uid,)).fetchone()
-  if not user: abort(404)
-  if user['role']=='admin' and user['active']:
-   count=c.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
-   if count<=1: return page('No se puede eliminar',"<div class='card'><p>No puedes eliminar al último administrador activo.</p><a class='button secondary' href='/admin/usuarios'>Volver</a></div>")
-  c.execute('DELETE FROM users WHERE id=?',(uid,))
+ if MICROSERVICES:
+  try: service_request(USUARIOS_URL,f'/interno/usuarios/{uid}','DELETE')
+  except ServiceError as error:
+   if error.status==409: return page('No se puede eliminar',"<div class='card'><p>"+esc(str(error))+"</p><a class='button secondary' href='/admin/usuarios'>Volver</a></div>")
+   if error.status==404: abort(404)
+   raise
+ else:
+  with db() as c:
+   user=c.execute('SELECT role,active FROM users WHERE id=?',(uid,)).fetchone()
+   if not user: abort(404)
+   if user['role']=='admin' and user['active']:
+    count=c.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
+    if count<=1: return page('No se puede eliminar',"<div class='card'><p>No puedes eliminar al último administrador activo.</p><a class='button secondary' href='/admin/usuarios'>Volver</a></div>")
+   c.execute('DELETE FROM users WHERE id=?',(uid,))
  return redirect('/admin/usuarios')
 
 @app.route('/admin/negocio/nuevo',methods=['GET','POST'])
@@ -994,25 +1163,44 @@ def new():
  if request.method=='POST':
   name=request.form.get('name','').strip()
   if not name: return page('Agregar puesto',"<div class='card'>El nombre es obligatorio."+form(request.form)+'</div>')
-  with db() as c:
-   count=c.execute('SELECT COUNT(*) FROM businesses').fetchone()[0]
-   if count >= 12: return page('Límite de puestos',"<div class='card'><h2>Ya tienes 12 puestos registrados</h2><p>Para este proyecto acordamos un máximo de 12. Edita o elimina un puesto antes de agregar otro.</p><a class='button' href='/admin'>Volver al panel</a></div>")
-  with db() as c: c.execute('INSERT INTO businesses(name,category,description,hours,location,contact,photos,menu) VALUES(?,?,?,?,?,?,?,?)',(name,request.form.get('category','Otro'),request.form.get('description',''),request.form.get('hours',''),request.form.get('location',''),request.form.get('contact',''),savephotos(),json.dumps(parse_menu(request.form.get('menu_json','[]')),ensure_ascii=False)))
+  if MICROSERVICES:
+   if len(businesses_list()) >= 12: return page('Límite de puestos',"<div class='card'><h2>Ya tienes 12 puestos registrados</h2><p>Para este proyecto acordamos un máximo de 12. Edita o elimina un puesto antes de agregar otro.</p><a class='button' href='/admin'>Volver al panel</a></div>")
+   try: service_request(PUESTOS_URL,'/interno/negocios','POST',business_payload())
+   except ServiceError as error:
+    if error.status==409: return page('Límite de puestos',"<div class='card'><h2>Ya tienes 12 puestos registrados</h2><p>Para este proyecto acordamos un máximo de 12. Edita o elimina un puesto antes de agregar otro.</p><a class='button' href='/admin'>Volver al panel</a></div>")
+    raise
+  else:
+   with db() as c:
+    count=c.execute('SELECT COUNT(*) FROM businesses').fetchone()[0]
+    if count >= 12: return page('Límite de puestos',"<div class='card'><h2>Ya tienes 12 puestos registrados</h2><p>Para este proyecto acordamos un máximo de 12. Edita o elimina un puesto antes de agregar otro.</p><a class='button' href='/admin'>Volver al panel</a></div>")
+   with db() as c: c.execute('INSERT INTO businesses(name,category,description,hours,location,contact,photos,menu) VALUES(?,?,?,?,?,?,?,?)',(name,request.form.get('category','Otro'),request.form.get('description',''),request.form.get('hours',''),request.form.get('location',''),request.form.get('contact',''),savephotos(),json.dumps(parse_menu(request.form.get('menu_json','[]')),ensure_ascii=False)))
   return redirect('/admin')
  return page('Agregar puesto',"<p class='muted'>Los datos y las fotografías se guardarán en la base de datos y en el disco del servidor.</p><div class='card'>"+form()+'</div>')
 @app.route('/admin/negocio/<int:bid>',methods=['GET','POST'])
 def edit(bid):
  if not logged(): return redirect('/admin/entrar')
- with db() as c: r=c.execute('SELECT * FROM businesses WHERE id=?',(bid,)).fetchone()
+ r=business_get(bid)
  if not r: abort(404)
  if request.method=='POST':
-  with db() as c: c.execute('UPDATE businesses SET name=?,category=?,description=?,hours=?,location=?,contact=?,photos=?,menu=? WHERE id=?',(request.form.get('name','').strip(),request.form.get('category','Otro'),request.form.get('description',''),request.form.get('hours',''),request.form.get('location',''),request.form.get('contact',''),savephotos(),json.dumps(parse_menu(request.form.get('menu_json','[]')),ensure_ascii=False),bid))
+  if MICROSERVICES:
+   try: service_request(PUESTOS_URL,f'/interno/negocios/{bid}','PUT',business_payload())
+   except ServiceError as error:
+    if error.status==404: abort(404)
+    raise
+  else:
+   with db() as c: c.execute('UPDATE businesses SET name=?,category=?,description=?,hours=?,location=?,contact=?,photos=?,menu=? WHERE id=?',(request.form.get('name','').strip(),request.form.get('category','Otro'),request.form.get('description',''),request.form.get('hours',''),request.form.get('location',''),request.form.get('contact',''),savephotos(),json.dumps(parse_menu(request.form.get('menu_json','[]')),ensure_ascii=False),bid))
   return redirect('/admin')
  return page('Editar puesto',"<div class='card'>"+form(r)+'</div>')
 @app.route('/admin/negocio/<int:bid>/eliminar',methods=['POST'])
 def delete(bid):
  if not logged(): return redirect('/admin/entrar')
- with db() as c: c.execute('DELETE FROM businesses WHERE id=?',(bid,))
+ if MICROSERVICES:
+  try: service_request(PUESTOS_URL,f'/interno/negocios/{bid}','DELETE')
+  except ServiceError as error:
+   if error.status==404: abort(404)
+   raise
+ else:
+  with db() as c: c.execute('DELETE FROM businesses WHERE id=?',(bid,))
  return redirect('/admin')
 @app.route('/<path:filename>')
 def files(filename):
@@ -1021,4 +1209,4 @@ def files(filename):
   if p.suffix.lower()=='.html' and p.name in EDITABLE_PAGES: return send_site_page(p.name)
   return send_from_directory(ROOT,filename)
  abort(404)
-if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.environ.get('PORT','5000')),debug=False)
+if __name__=='__main__': app.run(host='127.0.0.1',port=int(os.environ.get('PORT','5090')),debug=False)

@@ -1,0 +1,50 @@
+name: lago
+
+services:
+  usuarios:
+    container_name: lago-usuarios
+    build:
+      context: .
+      dockerfile: servicios/Dockerfile
+      args:
+        SERVICE_NAME: usuarios
+    environment:
+      PORT: '5001'
+      USUARIOS_DB: /data/usuarios.db
+      LAGO_SEED_DB: /seed/lago.db
+      LAGO_SERVICE_TOKEN: ${LAGO_SERVICE_TOKEN:?Primero ejecuta py configurar_local.py}
+    volumes:
+      - ./datos/usuarios:/data
+    ports:
+      - '127.0.0.1:5181:5001'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/salud', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  puestos:
+    container_name: lago-puestos
+    build:
+      context: .
+      dockerfile: servicios/Dockerfile
+      args:
+        SERVICE_NAME: puestos
+    environment:
+      PORT: '5002'
+      PUESTOS_DB: /data/puestos.db
+      LAGO_SEED_DB: /seed/lago.db
+      LAGO_SERVICE_TOKEN: ${LAGO_SERVICE_TOKEN:?Primero ejecuta py configurar_local.py}
+    volumes:
+      - ./datos/puestos:/data
+    ports:
+      - '127.0.0.1:5182:5002'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5002/salud', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
